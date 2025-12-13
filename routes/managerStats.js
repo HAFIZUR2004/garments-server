@@ -1,36 +1,68 @@
+// routes/manager.js
+const express = require("express");
+const { ObjectId } = require("mongodb");
+
 module.exports = (db, admin) => {
-  const router = require("express").Router();
+  const router = express.Router();
   const orders = db.collection("orders");
-  const products = db.collection("products");
   const users = db.collection("users");
 
+  // Verify manager token
   const verifyToken = async (req, res, next) => {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = await admin.auth().verifyIdToken(token);
-    const dbUser = await users.findOne({ email: decoded.email });
+    try {
+      const token = req.headers.authorization?.split(" ")[1];
+      if (!token) return res.status(401).send({ error: "No token" });
 
-    if (dbUser?.role !== "manager") {
-      return res.status(403).send({ error: "Manager only" });
+      const decoded = await admin.auth().verifyIdToken(token);
+      const dbUser = await users.findOne({ email: decoded.email });
+      if (!dbUser || dbUser.role !== "manager") {
+        return res.status(403).send({ error: "Manager only" });
+      }
+
+      req.user = dbUser;
+      next();
+    } catch (err) {
+      console.error(err);
+      res.status(403).send({ error: "Invalid token" });
     }
-
-    req.user = dbUser;
-    next();
   };
 
-  router.get("/stats", verifyToken, async (req, res) => {
-    const email = req.user.email;
+  // Get Pending Orders
+  router.get("/pending-orders", verifyToken, async (req, res) => {
+    const pendingOrders = await orders
+      .find({ status: "Pending" })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(pendingOrders);
+  });
 
-    const myProducts = await products.countDocuments({ managerEmail: email });
-    const pending = await orders.countDocuments({ status: "Pending" });
-    const approved = await orders.countDocuments({ status: "Approved" });
-    const totalOrders = await orders.countDocuments();
+  // Get Approved Orders
+  router.get("/approved-orders", verifyToken, async (req, res) => {
+    const approvedOrders = await orders
+      .find({ status: "Approved" })
+      .sort({ approvedAt: -1 })
+      .toArray();
+    res.send(approvedOrders);
+  });
 
-    res.send({
-      products: myProducts,
-      pending,
-      approved,
-      totalOrders,
-    });
+  // Approve Order
+  router.patch("/orders/:id/approve", verifyToken, async (req, res) => {
+    const orderId = req.params.id;
+    const result = await orders.updateOne(
+      { _id: new ObjectId(orderId) },
+      { $set: { status: "Approved", approvedAt: new Date() } }
+    );
+    res.send({ success: true });
+  });
+
+  // Reject Order
+  router.patch("/orders/:id/reject", verifyToken, async (req, res) => {
+    const orderId = req.params.id;
+    const result = await orders.updateOne(
+      { _id: new ObjectId(orderId) },
+      { $set: { status: "Rejected", rejectedAt: new Date() } }
+    );
+    res.send({ success: true });
   });
 
   return router;
