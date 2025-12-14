@@ -1,11 +1,15 @@
+// routes/orders.js
 const { ObjectId } = require("mongodb");
 
 module.exports = (db, admin) => {
   const router = require("express").Router();
   const orders = db.collection("orders");
   const users = db.collection("users");
+  const products = db.collection("products");
 
-  // Verify JWT
+  // =======================
+  // JWT Verification Middleware
+  // =======================
   const verifyToken = async (req, res, next) => {
     try {
       const authHeader = req.headers.authorization;
@@ -24,7 +28,60 @@ module.exports = (db, admin) => {
     }
   };
 
-  // Get my orders
+  // =======================
+  // Book Order
+  // =======================
+  router.post("/book", verifyToken, async (req, res) => {
+    try {
+      const {
+        firstName,
+        lastName,
+        contact,
+        address,
+        notes,
+        productId,
+        productName,
+        quantity,
+        orderPrice,
+      } = req.body;
+
+      if (!productId || !quantity || !orderPrice)
+        return res.status(400).send({ error: "Missing required fields" });
+
+      // Check product exists
+      const product = await products.findOne({ _id: new ObjectId(productId) });
+      if (!product) return res.status(404).send({ error: "Product not found" });
+
+      if (quantity > product.quantity)
+        return res.status(400).send({ error: "Quantity exceeds available stock" });
+
+      // Insert order
+      const result = await orders.insertOne({
+        userId: req.user.uid,
+        userEmail: req.user.email,
+        firstName,
+        lastName,
+        contact,
+        address,
+        notes,
+        productId,
+        productName,
+        quantity,
+        orderPrice,
+        status: "Pending",
+        createdAt: new Date(),
+      });
+
+      res.send({ success: true, insertedId: result.insertedId });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ error: "Failed to place order" });
+    }
+  });
+
+  // =======================
+  // Get My Orders
+  // =======================
   router.get("/my-orders/:uid", verifyToken, async (req, res) => {
     try {
       const userId = req.params.uid;
@@ -35,21 +92,26 @@ module.exports = (db, admin) => {
       res.status(500).send({ error: "Failed to fetch orders" });
     }
   });
-// Get all orders (admin only)
-router.get("/", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "admin") {
-      return res.status(403).send({ error: "Forbidden: Admin only" });
-    }
-    const allOrders = await orders.find().toArray();
-    res.send(allOrders);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ error: "Failed to fetch orders" });
-  }
-});
 
-  // Cancel order
+  // =======================
+  // Get All Orders (Admin only)
+  // =======================
+  router.get("/", verifyToken, async (req, res) => {
+    try {
+      if (req.user.role !== "admin") {
+        return res.status(403).send({ error: "Forbidden: Admin only" });
+      }
+      const allOrders = await orders.find().toArray();
+      res.send(allOrders);
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ error: "Failed to fetch orders" });
+    }
+  });
+
+  // =======================
+  // Cancel Order
+  // =======================
   router.patch("/cancel/:id", verifyToken, async (req, res) => {
     try {
       const { id } = req.params;
