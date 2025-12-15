@@ -1,6 +1,9 @@
+// index.js (সংশোধিত)
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+// ❌ এই লাইনটি মুছে ফেলা হলো: const stripe = require('stripe')(process.env.STRIPE_SECRET);
+
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const admin = require("./config/firebaseAdmin");
 
@@ -30,7 +33,8 @@ async function run() {
 
     // ================= ROUTES =================
     app.use("/api/products", require("./routes/products")(db));
-    app.use("/api/orders", require("./routes/orders")(db, admin));
+    // routes/orders.js কে লোড করা হলো
+    app.use("/api/orders", require("./routes/orders")(db, admin)); 
     app.use("/api/users", require("./routes/users")(db));
     app.use("/api/admin", require("./routes/adminStats")(db, admin));
     app.use("/api/manager", require("./routes/managerStats")(db, admin));
@@ -51,4 +55,3 @@ run();
 app.get("/", (req, res) => {
   res.send("✅ Garments Server Running");
 });
-// amr sonar bangla 
