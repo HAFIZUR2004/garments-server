@@ -1,10 +1,7 @@
-// routes/orders.js (সংশোধিত)
-
+// routes/orders.js
 const { ObjectId } = require("mongodb");
-// ❌ এই লাইনটি মুছে ফেলা হলো বা কমেন্ট করা হলো: const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY); 
 
 module.exports = (db, admin) => {
-  // ✅ Stripe ইনিশিয়ালাইজেশন এখানে করা হলো, STRIPE_SECRET ব্যবহার করে
   const stripe = require("stripe")(process.env.STRIPE_SECRET);
 
   const router = require("express").Router();
@@ -12,7 +9,7 @@ module.exports = (db, admin) => {
   const productsCollection = db.collection("products");
   const usersCollection = db.collection("users");
 
-  // ================= JWT Verify Middleware =================
+  // ================= JWT Verify =================
   const verifyToken = async (req, res, next) => {
     try {
       const token = req.headers.authorization?.split(" ")[1];
@@ -26,38 +23,54 @@ module.exports = (db, admin) => {
         uid: decoded.uid,
         email: decoded.email,
         role: dbUser.role,
-        name: dbUser.name,
         status: dbUser.status,
       };
 
       next();
     } catch (err) {
-      console.error("JWT Verification Error:", err);
+      console.error(err);
       res.status(403).send({ error: "Unauthorized" });
     }
   };
 
-  // ================= 🎯 Stripe Checkout Session তৈরি =================
+  // ================= STRIPE PAYFIRST =================
   router.post("/create-checkout-session", verifyToken, async (req, res) => {
     try {
-      // Stripe ইনিশিয়ালাইজ না হলে ট্র্যাপিং
-      if (!stripe) {
-        return res.status(500).send({ error: "Payment gateway configuration error. Secret key missing." });
-      }
-
-      if (req.user.status === 'suspended') {
-        return res.status(403).send({ error: "Your account is suspended. You cannot place new orders." });
+      if (req.user.status === "suspended") {
+        return res.status(403).send({ error: "Account suspended" });
       }
 
       const { orderData } = req.body;
-      const { productId, productName, quantity, orderPrice, address, notes, paymentMethod } = orderData;
+      const {
+        productId,
+        productName,
+        quantity,
+        orderPrice,
+        address,
+        notes,
+        paymentMethod,
+        firstName,
+        lastName,
+        contactNumber,
+      } = orderData;
 
-      const product = await productsCollection.findOne({ _id: new ObjectId(productId) });
+      if (paymentMethod !== "PayFirst") {
+        return res.status(400).send({ error: "Invalid payment method" });
+      }
+
+      const product = await productsCollection.findOne({
+        _id: new ObjectId(productId),
+      });
+
       if (!product) return res.status(404).send({ error: "Product not found" });
-      if (quantity > product.availableQuantity) return res.status(400).send({ error: "Order quantity exceeds available stock" });
+      if (quantity < product.minOrder)
+        return res.status(400).send({ error: "Below minimum order quantity" });
+      if (quantity > product.availableQuantity)
+        return res.status(400).send({ error: "Insufficient stock" });
 
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ["card"],
+        mode: "payment",
         line_items: [
           {
             price_data: {
@@ -66,48 +79,43 @@ module.exports = (db, admin) => {
                 name: productName,
                 description: `Quantity: ${quantity}`,
               },
-              // মূল্য সেন্ট-এ রূপান্তর (Stripe-এর প্রয়োজন)
               unit_amount: Math.round(orderPrice * 100),
             },
             quantity: 1,
           },
         ],
-        mode: "payment",
         metadata: {
           userId: req.user.uid,
           email: req.user.email,
-          productId: productId,
-          quantity: String(quantity), // Stripe metadata string হিসেবে সংরক্ষণ করে
-          paymentMethod: paymentMethod,
-          address: address,
+          productId,
+          quantity: String(quantity),
+          paymentMethod,
+          address,
+          firstName,
+          lastName,
+          contactNumber,
+          notes: notes || "",
         },
         success_url: `${process.env.FRONTEND_URL}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.FRONTEND_URL}/dashboard/my-orders?payment_status=cancelled`,
+        cancel_url: `${process.env.FRONTEND_URL}/dashboard/my-orders`,
       });
 
       res.send({ url: session.url });
-
     } catch (err) {
-      console.error("Stripe Checkout Error:", err);
-      res.status(500).send({ error: "Failed to create checkout session" });
+      console.error("Stripe Error:", err);
+      res.status(500).send({ error: "Stripe session failed" });
     }
   });
 
-  // ================= 🎯 Payment Success (Final Order Placement) =================
+  // ================= STRIPE PAYMENT SUCCESS =================
   router.post("/payment-success", verifyToken, async (req, res) => {
     try {
-      // Stripe ইনিশিয়ালাইজ না হলে ট্র্যাপিং
-      if (!stripe) {
-        return res.status(500).send({ error: "Payment gateway configuration error. Secret key missing." });
-      }
-
       const { sessionId } = req.body;
-
-      if (!sessionId) return res.status(400).send({ error: "Missing session ID" });
+      if (!sessionId) return res.status(400).send({ error: "Missing sessionId" });
 
       const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-      if (session.payment_status !== 'paid') {
+      if (session.payment_status !== "paid") {
         return res.status(400).send({ error: "Payment not completed" });
       }
 
@@ -115,28 +123,48 @@ module.exports = (db, admin) => {
         return res.status(403).send({ error: "User mismatch" });
       }
 
-      const { userId, email, productId, quantity, paymentMethod, address } = session.metadata;
-      const orderPrice = session.amount_total / 100;
-
-      const productNameLineItem = session.line_items?.data[0]?.description;
-      const productName = (productNameLineItem && productNameLineItem.includes('Quantity:'))
-        ? productNameLineItem.split('Quantity: ')[0].trim()
-        : 'Unknown Product (Check Metadata)';
-
-      const existingOrder = await ordersCollection.findOne({ paymentSessionId: sessionId });
+      const existingOrder = await ordersCollection.findOne({
+        paymentSessionId: sessionId,
+      });
       if (existingOrder) {
         return res.send({ success: true, orderId: existingOrder._id });
       }
 
-      const newOrder = {
-        userId,
-        email,
+      const {
         productId,
-        productName,
-        quantity: Number(quantity),
-        orderPrice: orderPrice,
+        quantity,
+        paymentMethod,
         address,
-        notes: "Online payment successful via PayFirst (Stripe Simulation)",
+        firstName,
+        lastName,
+        contactNumber,
+        notes,
+      } = session.metadata;
+
+      const product = await productsCollection.findOne({
+        _id: new ObjectId(productId),
+      });
+
+      if (!product) return res.status(404).send({ error: "Product not found" });
+
+      if (Number(quantity) > product.availableQuantity) {
+        return res.status(400).send({ error: "Stock unavailable" });
+      }
+
+      const orderPrice = session.amount_total / 100;
+
+      const newOrder = {
+        userId: req.user.uid,
+        email: req.user.email,
+        productId,
+        productName: product.name,
+        quantity: Number(quantity),
+        orderPrice,
+        firstName,
+        lastName,
+        contactNumber,
+        address,
+        notes: notes || "Paid via Stripe",
         paymentMethod,
         status: "Pending",
         createdAt: new Date(),
@@ -144,71 +172,93 @@ module.exports = (db, admin) => {
         paidAt: new Date(),
       };
 
-      const result = await ordersCollection.insertOne(newOrder);
+      await ordersCollection.insertOne(newOrder);
 
-      res.send({ success: true, orderId: result.insertedId });
+      // ✅ STOCK UPDATE
+      await productsCollection.updateOne(
+        { _id: new ObjectId(productId) },
+        { $inc: { availableQuantity: -Number(quantity) } }
+      );
+
+      res.send({ success: true });
     } catch (err) {
-      console.error("Payment Success Order Placement Error:", err);
-      res.status(500).send({ error: "Failed to process payment and place order" });
+      console.error(err);
+      res.status(500).send({ error: "Payment success failed" });
     }
   });
 
-  // ================= Buy Now (COD-এর জন্য) =================
+  // ================= COD / bKash =================
   router.post("/buy-now", verifyToken, async (req, res) => {
     try {
-      if (req.user.status === 'suspended') {
-        return res.status(403).send({ error: "Your account is suspended. You cannot place new orders." });
+      if (req.user.status === "suspended") {
+        return res.status(403).send({ error: "Account suspended" });
       }
 
-      const { productId, productName, quantity, orderPrice, address, notes, paymentMethod } = req.body;
-      if (paymentMethod !== "Cash on Delivery") {
-        return res.status(400).send({ error: "Invalid payment method for this route. Use /create-checkout-session for PayFirst." });
+      const {
+        productId,
+        productName,
+        quantity,
+        orderPrice,
+        address,
+        notes,
+        paymentMethod,
+        firstName,
+        lastName,
+        contactNumber,
+      } = req.body;
+
+      if (!["Cash on Delivery", "bKash"].includes(paymentMethod)) {
+        return res.status(400).send({ error: "Invalid payment method" });
       }
 
-      const newOrder = {
+      const product = await productsCollection.findOne({
+        _id: new ObjectId(productId),
+      });
+
+      if (!product) return res.status(404).send({ error: "Product not found" });
+      if (quantity < product.minOrder)
+        return res.status(400).send({ error: "Below minimum order quantity" });
+      if (quantity > product.availableQuantity)
+        return res.status(400).send({ error: "Insufficient stock" });
+
+      await ordersCollection.insertOne({
         userId: req.user.uid,
         email: req.user.email,
         productId,
         productName,
         quantity: Number(quantity),
         orderPrice: Number(orderPrice),
+        firstName,
+        lastName,
+        contactNumber,
         address,
         notes: notes || "",
-        paymentMethod: paymentMethod,
+        paymentMethod,
         status: "Pending",
         createdAt: new Date(),
-      };
+      });
 
-      const result = await ordersCollection.insertOne(newOrder);
-      res.send({ success: true, orderId: result.insertedId });
+      // ✅ STOCK UPDATE
+      await productsCollection.updateOne(
+        { _id: new ObjectId(productId) },
+        { $inc: { availableQuantity: -Number(quantity) } }
+      );
 
+      res.send({ success: true });
     } catch (err) {
       console.error(err);
-      res.status(500).send({ error: "Failed to place order" });
-    }
-  });
-  // routes/orders.js (এই অংশটি সঠিক আছে)
-
-  // ================= Get My Orders =================
-  router.get("/my-orders", verifyToken, async (req, res) => { // ✅ এই রুটটি ফ্রন্টএন্ডে /api/orders/my-orders হিসেবে কল করা হয়েছে
-    try {
-      // টোকেন ভেরিফিকেশন থেকে পাওয়া UID ব্যবহার করে অর্ডার আনা হচ্ছে
-      const myOrders = await ordersCollection.find({ userId: req.user.uid }).toArray();
-      res.send(myOrders);
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ error: "Failed to fetch orders" });
+      res.status(500).send({ error: "Order failed" });
     }
   });
 
-  // ... (বাকি কোড অপরিবর্তিত) ...
-  // ================= Get My Orders =================
+  // ================= MY ORDERS =================
   router.get("/my-orders", verifyToken, async (req, res) => {
     try {
-      const myOrders = await ordersCollection.find({ userId: req.user.uid }).toArray();
-      res.send(myOrders);
+      const orders = await ordersCollection
+        .find({ userId: req.user.uid })
+        .toArray();
+      res.send(orders);
     } catch (err) {
-      console.error(err);
       res.status(500).send({ error: "Failed to fetch orders" });
     }
   });
