@@ -4,7 +4,7 @@ const Stripe = require("stripe");
 const dotenv = require('dotenv');
 dotenv.config();
 
-// db = MongoDB Client, admin = Firebase Admin
+// মডিউল এক্সপোর্ট করা
 module.exports = (db, admin) => {
     const router = express.Router();
     const stripe = Stripe(process.env.STRIPE_SECRET);
@@ -13,8 +13,7 @@ module.exports = (db, admin) => {
     const productsCollection = db.collection("products");
     const usersCollection = db.collection("users");
 
-    // ================= JWT VERIFY =================
-    // ... (rest of verifyToken remains the same)
+    // ================= JWT VERIFY (Middleware) =================
     const verifyToken = async (req, res, next) => {
         try {
             const token = req.headers.authorization?.split(" ")[1];
@@ -22,46 +21,129 @@ module.exports = (db, admin) => {
 
             const decoded = await admin.auth().verifyIdToken(token);
             const dbUser = await usersCollection.findOne({ email: decoded.email });
+
             if (!dbUser) return res.status(403).send({ error: "User not found" });
 
             req.user = {
                 uid: decoded.uid,
                 email: decoded.email,
-                status: dbUser.status,
+                role: dbUser.role,
+                status: dbUser.status
             };
+
             next();
         } catch (err) {
+            console.error("Token verification failed:", err.message);
             res.status(403).send({ error: "Unauthorized" });
         }
     };
+    // ================= CHECK BUYER SUSPEND (Middleware) =================
+const checkBuyerSuspend = (req, res, next) => {
+    if (req.user.role === "buyer" && req.user.status === "suspended") {
+        return res.status(403).json({
+            message: "Account suspended. You cannot place new orders.",
+        });
+    }
+    next();
+};
 
-    // ================= ✅ ফিক্সড STRIPE CHECKOUT =================
+
+//     router.post("/", verifyToken, checkBuyerSuspend, async (req, res) => {
+//   // create order logic
+// });
+
+// const checkBuyerSuspend = (req, res, next) => {
+//   if (req.user.role === "buyer" && req.user.status === "suspended") {
+//     return res.status(403).json({
+//       message: "Account suspended. You cannot place new orders.",
+//     });
+//   }
+//   next();
+// };
+    // ================= ORDERS ROUTES =================
+
+    // 1. GET ALL ORDERS (ADMIN/MANAGER ONLY)
+    router.get("/all", verifyToken, async (req, res) => {
+        if (!["admin","manager"].includes(req.user.role))
+            return res.status(403).send({ error: "Access denied." });
+        try {
+            const orders = await ordersCollection.find({}).sort({ createdAt: -1 }).toArray();
+            res.send(orders);
+        } catch (error) {
+            res.status(500).send({ error: "Server error" });
+        }
+    });
+
+    // 2. UPDATE ORDER STATUS
+    router.patch("/update-status/:id", verifyToken, async (req, res) => {
+        if (!["admin","manager"].includes(req.user.role))
+            return res.status(403).send({ error: "Access denied." });
+
+        const { id } = req.params;
+        const { status: newStatus } = req.body;
+
+        try {
+            await ordersCollection.updateOne(
+                { _id: new ObjectId(id) },
+                { 
+                    $set: { status: newStatus },
+                    $push: {
+                        trackingSteps: {
+                            status: newStatus,
+                            location: "Updated by Staff",
+                            date: new Date(),
+                            notes: `Order status changed to ${newStatus}.`
+                        }
+                    }
+                }
+            );
+            res.send({ success: true });
+        } catch (error) {
+            res.status(500).send({ error: "Update failed" });
+        }
+    });
+
+    // 3. TRACK ORDER BY ID
+  router.get("/track/:orderId", verifyToken, async (req, res) => {
+    try {
+      const order = await ordersCollection.findOne({
+        _id: new ObjectId(req.params.orderId),
+        userId: req.user.uid
+      });
+
+      if (!order) {
+        return res.status(404).send({ message: "Order not found" });
+      }
+
+      res.send(order);
+    } catch (err) {
+      res.status(500).send({ error: "Server error" });
+    }
+  });
+
+
+    // 4. STRIPE CHECKOUT
     router.post("/create-checkout-session", verifyToken, async (req, res) => {
         try {
-            // ✅ ফিক্স: প্রথমে orderData অবজেক্টটি req.body থেকে নিন
             const { orderData } = req.body;
-            
             if (!orderData) return res.status(400).send({ error: "Order data missing." });
 
             const {
                 productId,
-                productName, // ✅ ফ্রন্টএন্ড থেকে productName পাঠানো হচ্ছে, তাই এখানেও destructure করা হলো
+                productName,
                 quantity,
-                orderPrice, // ফ্রন্টএন্ড থেকে final orderPrice আসছে
+                orderPrice,
                 address,
                 notes,
                 firstName,
                 lastName,
+                
                 contactNumber,
-            } = orderData; // ✅ এখন orderData থেকে ডেটা destructure করুন
+            } = orderData;
 
-            const product = await productsCollection.findOne({
-                _id: new ObjectId(productId),
-            });
-
+            const product = await productsCollection.findOne({ _id: new ObjectId(productId) });
             if (!product) return res.status(404).send({ error: "Product not found" });
-            
-            // Quantity validation (ensure data types are correct)
+
             const numQuantity = Number(quantity);
             const numOrderPrice = Number(orderPrice);
 
@@ -70,10 +152,6 @@ module.exports = (db, admin) => {
             if (numQuantity > product.availableQuantity)
                 return res.status(400).send({ error: "Out of stock" });
 
-            // Note: Stripe price should ideally be recalculated here for maximum security, 
-            // but we'll use the passed orderPrice for simplicity now.
-            // const calculatedPrice = product.price * numQuantity;
-
             const session = await stripe.checkout.sessions.create({
                 payment_method_types: ["card"],
                 mode: "payment",
@@ -81,15 +159,14 @@ module.exports = (db, admin) => {
                     {
                         price_data: {
                             currency: "usd",
-                            product_data: { name: productName || product.name }, // productName ব্যবহার করা হলো
-                            unit_amount: Math.round(numOrderPrice * 100), // ✅ ফ্রন্টএন্ডের পাঠানো মূল্য সেন্টে ব্যবহার করা হলো
+                            product_data: { name: productName || product.name },
+                            unit_amount: Math.round(numOrderPrice * 100),
                         },
                         quantity: 1,
                     },
                 ],
-                // ✅ metadata তে সমস্ত ডেটা স্ট্রিং হিসেবে রাখতে হবে
                 metadata: {
-                    productId: productId,
+                    productId,
                     quantity: String(numQuantity),
                     orderPrice: String(numOrderPrice),
                     userId: req.user.uid,
@@ -107,97 +184,107 @@ module.exports = (db, admin) => {
             res.send({ url: session.url });
         } catch (err) {
             console.error("Stripe Checkout Error:", err);
-            // ✅ রিয়েল এরর মেসেজ পাঠানো হলো
             res.status(500).send({ error: "Stripe Checkout Failed. Check server logs." });
         }
     });
 
-    // ================= STRIPE PAYMENT SUCCESS =================
-    // ... (rest of payment-success remains the same, but please verify metadata usage)
-    router.post("/payment-success", verifyToken, async (req, res) => {
-        try {
-            const { sessionId } = req.body;
+    // 5. STRIPE PAYMENT SUCCESS
+  // 5. STRIPE PAYMENT SUCCESS (Updated)
+router.post("/payment-success", verifyToken, async (req, res) => {
+    try {
+        const { sessionId } = req.body;
+        if (!sessionId) return res.status(400).send({ error: "Session ID missing." });
 
-            const session = await stripe.checkout.sessions.retrieve(sessionId);
-            if (session.payment_status !== "paid")
-                return res.status(400).send({ error: "Payment not completed" });
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-            const exists = await ordersCollection.findOne({
-                paymentSessionId: sessionId,
-            });
-            if (exists) return res.send({ success: true, orderId: exists._id }); // ✅ orderId রিটার্ন করা হলো
+        console.log("Stripe Session:", session); // Debug
 
-            const { productId, quantity, address, notes, firstName, lastName, contactNumber, orderPrice } = session.metadata; // ✅ মেটাডেটা থেকে অতিরিক্ত ফিল্ড গ্রহণ
+        if (session.payment_status !== "paid")
+            return res.status(400).send({ error: "Payment not completed" });
 
-            // ⚠️ Warning: You are decreasing quantity BEFORE placing the order. 
-            // This is generally better done by webhook, but for a simple flow, it's acceptable.
-            await productsCollection.updateOne(
-                { _id: new ObjectId(productId), availableQuantity: { $gte: Number(quantity) } },
-                { $inc: { availableQuantity: -Number(quantity) } }
-            );
+        // Check if order already exists
+        const exists = await ordersCollection.findOne({ paymentSessionId: sessionId });
+        if (exists) return res.send({ success: true, orderId: exists._id });
 
-            const newOrder = {
-                userId: session.metadata.userId,
-                email: session.metadata.email,
-                productId,
-                quantity: Number(quantity),
-                orderPrice: Number(orderPrice), // ✅ orderPrice যুক্ত করা হলো
-                address,
-                notes,
-                firstName, // ✅ নতুন ফিল্ড
-                lastName, // ✅ নতুন ফিল্ড
-                contactNumber, // ✅ নতুন ফিল্ড
-                paymentMethod: "PayFirst", // Hardcoded to 'PayFirst' or 'Stripe'
-                status: "Paid",
-                paymentSessionId: sessionId,
-                createdAt: new Date(),
-            };
+        // Destructure metadata safely
+        const {
+            productId,
+            quantity,
+            address,
+            notes,
+            firstName,
+            lastName,
+            contactNumber,
+            orderPrice,
+            sellerEmail // make sure frontend sends this
+        } = session.metadata;
 
-            const result = await ordersCollection.insertOne(newOrder);
+        // Update product availableQuantity
+        await productsCollection.updateOne(
+            { _id: new ObjectId(productId), availableQuantity: { $gte: Number(quantity) } },
+            { $inc: { availableQuantity: -Number(quantity) } }
+        );
 
-            res.send({ success: true, orderId: result.insertedId });
-        } catch (err) {
-            console.error("Payment success failed:", err);
-            res.status(500).send({ error: "Payment success failed" });
-        }
-    });
+        // Insert new order
+        const newOrder = {
+            userId: session.metadata.userId,
+            email: session.metadata.email,
+            productId,
+            quantity: Number(quantity),
+            orderPrice: Number(orderPrice),
+            address,
+            notes,
+            firstName,
+            lastName,
+            sellerEmail: sellerEmail || "default@example.com", // fallback
+            contactNumber,
+            paymentMethod: "PayFirst",
+            status: "Paid",
+            paymentSessionId: sessionId,
+            createdAt: new Date(),
+        };
 
+        const result = await ordersCollection.insertOne(newOrder);
 
-    // ================= COD / bKash =================
-    // ... (rest of buy-now needs the new fields too)
+        res.send({ success: true, orderId: result.insertedId });
+    } catch (err) {
+        console.error("Payment success failed:", err.message);
+        res.status(500).send({ error: err.message });
+    }
+});
+
+    // 6. COD / bKash ORDER
     router.post("/buy-now", verifyToken, async (req, res) => {
         try {
             const {
                 productId,
                 quantity,
+                sellerEmail,
                 paymentMethod,
                 address,
                 notes,
-                orderPrice, // ✅ ফ্রন্টএন্ড থেকে আসছে
-                firstName, // ✅ ফ্রন্টএন্ড থেকে আসছে
-                lastName, // ✅ ফ্রন্টএন্ড থেকে আসছে
-                contactNumber, // ✅ ফ্রন্টএন্ড থেকে আসছে
+                orderPrice,
+                firstName,
+                lastName,
+                
+                contactNumber,
+                
             } = req.body;
 
             if (!["Cash on Delivery", "bKash"].includes(paymentMethod))
                 return res.status(400).send({ error: "Invalid method" });
 
-            const product = await productsCollection.findOne({
-                _id: new ObjectId(productId),
-            });
-
+            const product = await productsCollection.findOne({ _id: new ObjectId(productId) });
             if (!product) return res.status(404).send({ error: "Product not found" });
             if (quantity > product.availableQuantity)
                 return res.status(400).send({ error: "Out of stock" });
 
-            // ⚠️ Warning: You are decreasing quantity BEFORE approval. 
-            // In real COD/bKash, stock is typically reserved or only decreased on approval.
             await productsCollection.updateOne(
                 { _id: new ObjectId(productId) },
                 { $inc: { availableQuantity: -Number(quantity) } }
             );
 
-            const result = await ordersCollection.insertOne({ // ✅ ডেটাবেসে সব ফিল্ড সেভ করা হলো
+            const result = await ordersCollection.insertOne({
                 userId: req.user.uid,
                 email: req.user.email,
                 productId,
@@ -205,28 +292,88 @@ module.exports = (db, admin) => {
                 orderPrice: Number(orderPrice),
                 address,
                 notes,
-                firstName, 
-                lastName, 
-                contactNumber, 
+                firstName,
+                lastName,
+                sellerEmail,
+                contactNumber,
                 paymentMethod,
                 status: "Pending",
                 createdAt: new Date(),
             });
 
-            res.send({ success: true, orderId: result.insertedId }); // ✅ orderId রিটার্ন করা হলো
+            res.send({ success: true, orderId: result.insertedId });
         } catch (err) {
             console.error("COD/bKash Order Failed:", err);
             res.status(500).send({ error: "Order failed" });
         }
     });
-    
-    // ... (rest of the file)
+
+    // 7. GET MY ORDERS
     router.get("/my-orders", verifyToken, async (req, res) => {
-        const orders = await ordersCollection
-            .find({ userId: req.user.uid })
-            .toArray();
-        res.send(orders);
+        try {
+            const orders = await ordersCollection.find({ userId: req.user.uid }).sort({ createdAt: -1 }).toArray();
+            res.send(orders);
+        } catch (error) {
+            res.status(500).send({ error: "Error" });
+        }
     });
 
-    return router;
+    // 8. CANCEL ORDER
+    router.patch("/cancel/:id", verifyToken, async (req, res) => {
+        const { id } = req.params;
+        try {
+            const result = await ordersCollection.updateOne(
+                { _id: new ObjectId(id), userId: req.user.uid, status: "Pending" },
+                { $set: { status: "Cancelled" } }
+            );
+            res.send({ success: true });
+        } catch (error) {
+            res.status(500).send({ error: "Error" });
+        }
+    });
+
+    // 9. MANAGER PENDING ORDERS
+    router.get("/manager/pending-orders", verifyToken, async (req, res) => {
+        if (!["manager","admin"].includes(req.user.role))
+            return res.status(403).send({ error: "Access denied." });
+        try {
+            const query = { sellerEmail: req.user.email, status: "Pending" };
+            const orders = await ordersCollection.find(query).sort({ createdAt: -1 }).toArray();
+            res.send(orders);
+        } catch (error) {
+            console.error(error);
+            res.status(500).send({ error: "Failed to fetch pending orders" });
+        }
+    });
+
+    // 10. MANAGER APPROVED ORDERS
+    router.get("/manager/approved-orders", verifyToken, async (req, res) => {
+        if (!["manager","admin"].includes(req.user.role))
+            return res.status(403).send({ error: "Access denied." });
+        try {
+            const query = { sellerEmail: req.user.email, status: "Approved" };
+            const orders = await ordersCollection.find(query).sort({ createdAt: -1 }).toArray();
+            res.send(orders);
+        } catch (error) {
+            res.status(500).send({ error: "Failed to fetch approved orders" });
+        }
+    });
+
+    // 11. SELLER ORDERS
+    router.get("/seller-orders", verifyToken, async (req, res) => {
+        try {
+            if (!["manager","admin"].includes(req.user.role))
+                return res.status(403).send({ error: "Access denied" });
+
+            const sellerEmail = req.user.email;
+            const orders = await ordersCollection.find({ sellerEmail }).sort({ createdAt: -1 }).toArray();
+            res.send(orders);
+        } catch (error) {
+            console.error("Seller orders fetch failed:", error);
+            res.status(500).send({ error: "Failed to load seller orders" });
+        }
+    });
+
+    return router; 
 };
+

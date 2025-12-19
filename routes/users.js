@@ -1,7 +1,6 @@
-// routes/users.js (সংশোধিত, সম্পূর্ণ কার্যকরী)
+// routes/users.js
 const { ObjectId } = require("mongodb");
 
-// 💡 মেইন সার্ভার থেকে 'admin' SDK পাস করা হচ্ছে
 module.exports = (db, admin) => { 
     const router = require("express").Router();
     const usersCollection = db.collection("users");
@@ -12,12 +11,11 @@ module.exports = (db, admin) => {
         if (!authorization) {
             return res.status(401).send({ error: "Unauthorized access - No token" });
         }
-        // Bearer Token থেকে শুধুমাত্র টোকেনটি বের করা
         const token = authorization.split(" ")[1];
 
         try {
             const decodedToken = await admin.auth().verifyIdToken(token);
-            req.decodedEmail = decodedToken.email; // ডিকোড করা ইমেল রিকোয়েস্টে সেভ করা হলো
+            req.decodedEmail = decodedToken.email; 
             next();
         } catch (error) {
             console.error("Token verification failed:", error.message);
@@ -80,7 +78,7 @@ module.exports = (db, admin) => {
             email,
             role: role || "buyer",
             status: "pending",
-            password, // Note: Hash password in production
+            password, 
             createdAt: new Date(),
         };
 
@@ -103,7 +101,6 @@ module.exports = (db, admin) => {
             role: user.role,
             status: user.status,
             photoURL: user.photoURL || "",
-            // ফোন নম্বরও যোগ করুন যদি এটি প্রোফাইলে থাকে:
             phone: user.phone || "",
         });
     });
@@ -122,7 +119,6 @@ module.exports = (db, admin) => {
 
     // Get all users
     router.get("/", async (req, res) => {
-        // 🚨 Note: Production environment-এ এটি Admin protected হওয়া উচিত
         const users = await usersCollection.find().toArray();
         res.status(200).json(users);
     });

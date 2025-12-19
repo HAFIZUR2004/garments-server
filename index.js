@@ -1,4 +1,4 @@
-// index.js (নোড সার্ভার - অপরিবর্তিত)
+// index.js 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
