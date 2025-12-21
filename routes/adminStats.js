@@ -35,3 +35,4 @@ module.exports = (db, admin) => {
 
   return router;
 };
+//adminStats
