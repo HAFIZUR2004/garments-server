@@ -189,3 +189,4 @@ router.get("/managed", async (req, res) => {
 
   return router;
 };
+// create product page 
